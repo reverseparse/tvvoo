@@ -2180,12 +2180,48 @@ app.get(['/live/manifest.m3u8', '/:cfg/live/manifest.m3u8', '/cfg-:cfg/live/mani
         res.send(m3u8);
     } catch (err: any) {
         console.error('[LiveManifest] Error serving live manifest:', err?.message);
+        // Never redirect to http:// - browser blocks mixed-content;
+        // fetch and rewrite the manifest server-side instead.
         try {
             const resolved = await resolveVavooCleanUrl(playUrl, clientIp);
             if (resolved?.url) {
-                return res.redirect(302, resolved.url);
+                const upRes = await fetch(resolved.url, {
+                    headers: {
+                        'User-Agent': 'VAVOO/2.6',
+                        'Accept': '*/*'
+                    },
+                    timeout: 10000
+                } as any);
+
+                if (upRes.ok) {
+                    const text = await upRes.text();
+                    const lastSlash = resolved.url.lastIndexOf('/');
+                    const baseUrl = resolved.url.substring(0, lastSlash + 1);
+
+                    const rewritten = liveManifestManager.rewrite(
+                        text,
+                        baseUrl,
+                        selfHost
+                    );
+
+                    res.setHeader(
+                        'Content-Type',
+                        'application/vnd.apple.mpegurl'
+                    );
+                    res.setHeader(
+                        'Cache-Control',
+                        'no-cache, no-store, must-revalidate'
+                    );
+                    res.setHeader(
+                        'Access-Control-Allow-Origin',
+                        '*'
+                    );
+
+                    return res.send(rewritten);
+                }
             }
         } catch {}
+
         res.status(500).send('Error generating live stream manifest');
     }
 });
