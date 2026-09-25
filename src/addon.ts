@@ -1962,6 +1962,7 @@ interface LiveStreamSession {
 
 class LiveManifestManager {
     private sessions: Map<string, LiveStreamSession> = new Map();
+    private refreshLocks: Map<string, Promise<LiveStreamSession>> = new Map();
 
     constructor() {
         const interval = setInterval(() => this.cleanup(), 10 * 60 * 1000);
@@ -1994,7 +1995,16 @@ class LiveManifestManager {
         const now = Date.now();
 
         if (!session || (session.validUntil - now) < 150 * 1000) {
-            session = await this.refreshSession(session, playUrl, clientIp, resolveFn);
+            // serialize concurrent refreshes for the same key
+            const existing = this.refreshLocks.get(key);
+            if (existing) {
+                session = await existing;
+            } else {
+                const lock = this.refreshSession(session, playUrl, clientIp, resolveFn)
+                    .finally(() => this.refreshLocks.delete(key));
+                this.refreshLocks.set(key, lock);
+                session = await lock;
+            }
         }
 
         session.lastFetchedAt = now;
