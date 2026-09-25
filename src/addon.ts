@@ -1948,6 +1948,7 @@ let fallbackPosterAbsUrl = TVVOO_FALLBACK_ABS;
 
 // --- MANIFEST-ONLY NO-FREEZE MANAGER ---
 interface LiveStreamSession {
+    lastRawManifest?: string | null;
     playUrl: string;
     clientIp: string | null;
     streamUrl: string;
@@ -1985,7 +1986,8 @@ class LiveManifestManager {
     public async getLiveManifest(
         playUrl: string,
         clientIp: string | null,
-        resolveFn: (url: string, ip: string | null) => Promise<{ url: string; headers?: Record<string, string>; validUntil?: number } | null>
+        resolveFn: (url: string, ip: string | null) => Promise<{ url: string; headers?: Record<string, string>; validUntil?: number } | null>,
+        selfHost?: string
     ): Promise<string> {
         const key = this.getKey(playUrl, clientIp);
         let session = this.sessions.get(key);
@@ -1997,9 +1999,9 @@ class LiveManifestManager {
 
         session.lastFetchedAt = now;
 
-        // Throttle rapid repeated manifest requests (< 2 seconds)
-        if (session.lastManifest && (now - session.lastManifestTime) < 2000) {
-            return session.lastManifest;
+        // Throttle rapid repeated manifest requests (< 2 seconds); rewrite with current selfHost
+        if (session.lastRawManifest && (now - session.lastManifestTime) < 2000) {
+            return this.rewrite(session.lastRawManifest, session.baseUrl, selfHost);
         }
 
         const fetchUpstream = async (streamUrl: string): Promise<string> => {
@@ -2028,10 +2030,10 @@ class LiveManifestManager {
             rawM3u8 = await fetchUpstream(session.streamUrl);
         }
 
-        const rewritten = this.rewrite(rawM3u8, session.baseUrl);
-        session.lastManifest = rewritten;
+        session.lastRawManifest = rawM3u8;
+        session.lastManifest = null;
         session.lastManifestTime = Date.now();
-        return rewritten;
+        return this.rewrite(rawM3u8, session.baseUrl, selfHost);
     }
 
     private async refreshSession(
@@ -2084,18 +2086,28 @@ class LiveManifestManager {
         }
     }
 
-    private rewrite(raw: string, baseUrl: string): string {
+    private rewrite(raw: string, baseUrl: string, selfHost?: string): string {
         const lines = raw.split(/\r?\n/);
         return lines.map(line => {
             const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+            if (!trimmed || trimmed.startsWith('#')) {
                 return line;
             }
-            try {
-                return new URL(trimmed, baseUrl).toString();
-            } catch {
-                return line;
+            // resolve relative URLs to absolute
+            let absUrl = trimmed;
+            if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+                try {
+                    absUrl = new URL(trimmed, baseUrl).toString();
+                } catch {
+                    return line;
+                }
             }
+            // rewrite http:// segment/manifest URLs through this server's proxy
+            // to avoid mixed-content blocks in HTTPS browser contexts
+            if (absUrl.startsWith('http://') && selfHost) {
+                return `${selfHost}/live/manifest.m3u8?url=${encodeURIComponent(absUrl)}`;
+            }
+            return absUrl;
         }).join('\n');
     }
 }
@@ -2110,8 +2122,11 @@ app.get(['/live/manifest.m3u8', '/:cfg/live/manifest.m3u8', '/cfg-:cfg/live/mani
         return res.status(400).send('Missing url parameter');
     }
     const clientIp = getClientIpFromReq(req);
+    const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
+    const hostStr = (req.headers['x-forwarded-host'] as string) || req.headers.host || '';
+    const selfHost = hostStr ? `${proto}://${hostStr}` : (lastRequestHost || '');
     try {
-        const m3u8 = await liveManifestManager.getLiveManifest(playUrl, clientIp, resolveVavooCleanUrl);
+        const m3u8 = await liveManifestManager.getLiveManifest(playUrl, clientIp, resolveVavooCleanUrl, selfHost);
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
         res.setHeader('Pragma', 'no-cache');
