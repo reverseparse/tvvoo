@@ -2096,7 +2096,7 @@ class LiveManifestManager {
         }
     }
 
-    private rewrite(raw: string, baseUrl: string, selfHost?: string): string {
+    public rewrite(raw: string, baseUrl: string, selfHost?: string): string {
         const lines = raw.split(/\r?\n/);
         return lines.map(line => {
             const trimmed = line.trim();
@@ -2135,6 +2135,41 @@ app.get(['/live/manifest.m3u8', '/:cfg/live/manifest.m3u8', '/cfg-:cfg/live/mani
     const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
     const hostStr = (req.headers['x-forwarded-host'] as string) || req.headers.host || '';
     const selfHost = hostStr ? `${proto}://${hostStr}` : (lastRequestHost || '');
+
+    // non-vavoo URLs are CDN segment/manifest URLs rewritten by rewrite() — proxy them directly
+    const isVavooUrl = playUrl.includes('vavoo.to');
+    if (!isVavooUrl) {
+        try {
+            const upRes = await fetch(playUrl, {
+                headers: { 'User-Agent': 'VAVOO/2.6', 'Accept': '*/*' },
+                timeout: 10000
+            } as any);
+            if (!upRes.ok) {
+                return res.status(upRes.status).send(`Upstream error: ${upRes.status}`);
+            }
+            const contentType = upRes.headers.get('content-type') || '';
+            const isM3u8 = contentType.includes('mpegurl') || contentType.includes('m3u') || playUrl.includes('.m3u8');
+            if (isM3u8) {
+                const text = await upRes.text();
+                const lastSlash = playUrl.lastIndexOf('/');
+                const baseUrl = lastSlash !== -1 ? playUrl.substring(0, lastSlash + 1) : playUrl;
+                // rewrite relative/http urls within this nested manifest too
+                const rewritten = (liveManifestManager as any).rewrite(text, baseUrl, selfHost);
+                res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+                res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                return res.send(rewritten);
+            }
+            // binary segment: pipe through
+            res.setHeader('Content-Type', contentType || 'video/mp2t');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            const buf = await upRes.buffer();
+            return res.send(buf);
+        } catch (err: any) {
+            return res.status(502).send(`Proxy error: ${err?.message}`);
+        }
+    }
+
     try {
         const m3u8 = await liveManifestManager.getLiveManifest(playUrl, clientIp, resolveVavooCleanUrl, selfHost);
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
